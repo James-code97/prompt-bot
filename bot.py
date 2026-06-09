@@ -2,19 +2,26 @@ import os
 import sqlite3
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+)
 
+# --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DB_PATH = "prompts.db"
-logging.basicConfig(level=logging.INFO)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Database ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
-            content TEXT NOT NULL
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -22,13 +29,19 @@ def init_db():
 
 def db_save(name, content):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO prompts (name, content) VALUES (?, ?)", (name, content))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("INSERT OR REPLACE INTO prompts (name, content) VALUES (?, ?)", (name, content))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"DB save error: {e}")
+        return False
+    finally:
+        conn.close()
 
 def db_get(name):
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT content FROM prompts WHERE LOWER(name) = LOWER(?)", (name,)).fetchone()
+    row = conn.execute("SELECT content FROM prompts WHERE name = ?", (name,)).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -40,18 +53,22 @@ def db_list():
 
 def db_delete(name):
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.execute("DELETE FROM prompts WHERE LOWER(name) = LOWER(?)", (name,))
+    cur = conn.execute("DELETE FROM prompts WHERE name = ?", (name,))
     conn.commit()
-    deleted = cursor.rowcount > 0
+    deleted = cur.rowcount > 0
     conn.close()
     return deleted
 
 def db_search(keyword):
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT name FROM prompts WHERE LOWER(name) LIKE LOWER(?) ORDER BY name", (f"%{keyword}%",)).fetchall()
+    rows = conn.execute(
+        "SELECT name FROM prompts WHERE LOWER(name) LIKE LOWER(?) ORDER BY name",
+        (f"%{keyword}%",)
+    ).fetchall()
     conn.close()
     return [r[0] for r in rows]
 
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📋 *Prompt Manager Bot*\n\n"
@@ -140,6 +157,7 @@ async def delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(f"🗑️ {n}", callback_data=f"del:{n}")] for n in names]
         await update.message.reply_text("Tap a prompt to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
+
     name = " ".join(context.args)
     if db_delete(name):
         await update.message.reply_text(f"🗑️ Deleted: {name}")
@@ -164,9 +182,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text(f"❌ Could not delete '{name}'.")
 
+# --- Main ---
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("save", save_prompt))
@@ -175,6 +195,7 @@ def main():
     app.add_handler(CommandHandler("find", find_prompt))
     app.add_handler(CommandHandler("delete", delete_prompt))
     app.add_handler(CallbackQueryHandler(button_handler))
+
     print("Bot started!")
     app.run_polling()
 
