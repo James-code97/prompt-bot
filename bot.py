@@ -1,6 +1,8 @@
 import os
-import sqlite3
+import json
+import base64
 import logging
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -8,65 +10,84 @@ from telegram.ext import (
 
 # --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DB_PATH = "prompts.db"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")       # e.g. "yourusername/prompt-bot"
+GITHUB_FILE = "prompts.json"
+GITHUB_BRANCH = "main"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Database ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+# --- GitHub JSON Storage ---
+def _github_url():
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+
+def _headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+def _load_prompts():
+    try:
+        r = requests.get(_github_url(), headers=_headers(), params={"ref": GITHUB_BRANCH})
+        if r.status_code == 200:
+            data = r.json()
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            return json.loads(content), data["sha"]
+        elif r.status_code == 404:
+            return {}, None
+        else:
+            logger.error(f"GitHub load error: {r.status_code} {r.text}")
+            return {}, None
+    except Exception as e:
+        logger.error(f"GitHub load exception: {e}")
+        return {}, None
+
+def _save_prompts(prompts, sha=None):
+    try:
+        content = base64.b64encode(json.dumps(prompts, indent=2, ensure_ascii=False).encode("utf-8")).decode("utf-8")
+        payload = {
+            "message": "Update prompts",
+            "content": content,
+            "branch": GITHUB_BRANCH
+        }
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(_github_url(), headers=_headers(), json=payload)
+        if r.status_code in (200, 201):
+            return True
+        else:
+            logger.error(f"GitHub save error: {r.status_code} {r.text}")
+            return False
+    except Exception as e:
+        logger.error(f"GitHub save exception: {e}")
+        return False
 
 def db_save(name, content):
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute("INSERT OR REPLACE INTO prompts (name, content) VALUES (?, ?)", (name, content))
-        conn.commit()
-        return True
-    except Exception as e:
-        logger.error(f"DB save error: {e}")
-        return False
-    finally:
-        conn.close()
+    prompts, sha = _load_prompts()
+    prompts[name] = content
+    return _save_prompts(prompts, sha)
 
 def db_get(name):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT content FROM prompts WHERE name = ?", (name,)).fetchone()
-    conn.close()
-    return row[0] if row else None
+    prompts, _ = _load_prompts()
+    return prompts.get(name)
 
 def db_list():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT name FROM prompts ORDER BY name").fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    prompts, _ = _load_prompts()
+    return sorted(prompts.keys())
 
 def db_delete(name):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute("DELETE FROM prompts WHERE name = ?", (name,))
-    conn.commit()
-    deleted = cur.rowcount > 0
-    conn.close()
-    return deleted
+    prompts, sha = _load_prompts()
+    if name in prompts:
+        del prompts[name]
+        return _save_prompts(prompts, sha)
+    return False
 
 def db_search(keyword):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT name FROM prompts WHERE LOWER(name) LIKE LOWER(?) ORDER BY name",
-        (f"%{keyword}%",)
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    prompts, _ = _load_prompts()
+    keyword_lower = keyword.lower()
+    return sorted([n for n in prompts if keyword_lower in n.lower()])
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,11 +126,13 @@ async def save_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content = parts[1].strip()
 
     if not name or not content:
-        await update.message.reply_text("⚠️ Both name and content are required.\n\nExample:\n/save moodle-html | Your prompt here...")
+        await update.message.reply_text("⚠️ Both name and content are required.")
         return
 
-    db_save(name, content)
-    await update.message.reply_text(f"✅ Prompt saved: *{name}*", parse_mode="Markdown")
+    if db_save(name, content):
+        await update.message.reply_text(f"✅ Prompt saved: {name}")
+    else:
+        await update.message.reply_text("❌ Error saving. Check bot logs.")
 
 async def get_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -184,7 +207,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 def main():
-    init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
