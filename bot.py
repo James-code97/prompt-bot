@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import hashlib
 import logging
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,6 +19,24 @@ GITHUB_BRANCH = "main"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# In-memory map for button callbacks
+_callback_map = {}
+
+def _make_callback(action, name):
+    """Create a short callback_data and store the mapping."""
+    short_id = hashlib.md5(name.encode()).hexdigest()[:8]
+    key = f"{action}:{short_id}"
+    _callback_map[key] = name
+    return key
+
+def _resolve_callback(data):
+    """Resolve callback_data back to (action, name)."""
+    name = _callback_map.get(data)
+    if name and ":" in data:
+        action = data.split(":")[0]
+        return action, name
+    return None, None
+
 # --- GitHub JSON Storage ---
 def _github_url():
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
@@ -30,15 +49,12 @@ def _headers():
 
 def _load_prompts():
     try:
-        logger.info(f"Loading prompts from GitHub: {GITHUB_REPO}")
         r = requests.get(_github_url(), headers=_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
-        logger.info(f"GitHub GET status: {r.status_code}")
         if r.status_code == 200:
             data = r.json()
             content = base64.b64decode(data["content"]).decode("utf-8")
             return json.loads(content), data["sha"]
         elif r.status_code == 404:
-            logger.info("prompts.json not found, starting fresh")
             return {}, None
         else:
             logger.error(f"GitHub load error: {r.status_code} {r.text}")
@@ -60,9 +76,7 @@ def _save_prompts(prompts, sha=None):
         }
         if sha:
             payload["sha"] = sha
-        logger.info(f"Saving prompts to GitHub, sha={sha}")
         r = requests.put(_github_url(), headers=_headers(), json=payload, timeout=10)
-        logger.info(f"GitHub PUT status: {r.status_code}")
         if r.status_code in (200, 201):
             return True
         else:
@@ -151,14 +165,13 @@ async def get_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not names:
             await update.message.reply_text("📭 No prompts saved yet. Use /save to add one.")
             return
-        keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"get:{n}")] for n in names]
+        keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=_make_callback("get", n))] for n in names]
         await update.message.reply_text("Tap a prompt to retrieve:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     name = " ".join(context.args)
     content = db_get(name)
     if content:
-        # Split long messages (Telegram 4096 char limit)
         header = f"📋 {name}\n\n"
         if len(header + content) > 4096:
             await update.message.reply_text(header)
@@ -175,7 +188,7 @@ async def list_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not names:
             await update.message.reply_text("📭 No prompts saved yet. Use /save to add one.")
             return
-        keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"get:{n}")] for n in names]
+        keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=_make_callback("get", n))] for n in names]
         await update.message.reply_text(f"📚 Your Prompts ({len(names)}):", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"list_prompts error: {e}")
@@ -190,7 +203,7 @@ async def find_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         await update.message.reply_text(f"🔍 No prompts matching: {keyword}")
         return
-    keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"get:{n}")] for n in results]
+    keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=_make_callback("get", n))] for n in results]
     await update.message.reply_text(f"🔍 Results for '{keyword}':", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,7 +212,7 @@ async def delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not names:
             await update.message.reply_text("📭 No prompts to delete.")
             return
-        keyboard = [[InlineKeyboardButton(f"🗑️ {n}", callback_data=f"del:{n}")] for n in names]
+        keyboard = [[InlineKeyboardButton(f"🗑️ {n}", callback_data=_make_callback("del", n))] for n in names]
         await update.message.reply_text("Tap a prompt to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -213,8 +226,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    if data.startswith("get:"):
-        name = data[4:]
+    action, name = _resolve_callback(data)
+
+    if not name:
+        await query.message.reply_text("❌ Button expired. Please use the command again.")
+        return
+
+    if action == "get":
         content = db_get(name)
         if content:
             header = f"📋 {name}\n\n"
@@ -226,8 +244,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(f"📋 {name}\n\n{content}")
         else:
             await query.message.reply_text(f"❌ Prompt '{name}' not found.")
-    elif data.startswith("del:"):
-        name = data[4:]
+    elif action == "del":
         if db_delete(name):
             await query.message.reply_text(f"🗑️ Deleted: {name}")
         else:
