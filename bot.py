@@ -11,7 +11,7 @@ from telegram.ext import (
 # --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")       # e.g. "yourusername/prompt-bot"
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE = "prompts.json"
 GITHUB_BRANCH = "main"
 
@@ -30,16 +30,22 @@ def _headers():
 
 def _load_prompts():
     try:
-        r = requests.get(_github_url(), headers=_headers(), params={"ref": GITHUB_BRANCH})
+        logger.info(f"Loading prompts from GitHub: {GITHUB_REPO}")
+        r = requests.get(_github_url(), headers=_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
+        logger.info(f"GitHub GET status: {r.status_code}")
         if r.status_code == 200:
             data = r.json()
             content = base64.b64decode(data["content"]).decode("utf-8")
             return json.loads(content), data["sha"]
         elif r.status_code == 404:
+            logger.info("prompts.json not found, starting fresh")
             return {}, None
         else:
             logger.error(f"GitHub load error: {r.status_code} {r.text}")
             return {}, None
+    except requests.exceptions.Timeout:
+        logger.error("GitHub request timed out")
+        return {}, None
     except Exception as e:
         logger.error(f"GitHub load exception: {e}")
         return {}, None
@@ -54,12 +60,17 @@ def _save_prompts(prompts, sha=None):
         }
         if sha:
             payload["sha"] = sha
-        r = requests.put(_github_url(), headers=_headers(), json=payload)
+        logger.info(f"Saving prompts to GitHub, sha={sha}")
+        r = requests.put(_github_url(), headers=_headers(), json=payload, timeout=10)
+        logger.info(f"GitHub PUT status: {r.status_code}")
         if r.status_code in (200, 201):
             return True
         else:
             logger.error(f"GitHub save error: {r.status_code} {r.text}")
             return False
+    except requests.exceptions.Timeout:
+        logger.error("GitHub save request timed out")
+        return False
     except Exception as e:
         logger.error(f"GitHub save exception: {e}")
         return False
@@ -147,17 +158,28 @@ async def get_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args)
     content = db_get(name)
     if content:
-        await update.message.reply_text(f"📋 {name}\n\n{content}")
+        # Split long messages (Telegram 4096 char limit)
+        header = f"📋 {name}\n\n"
+        if len(header + content) > 4096:
+            await update.message.reply_text(header)
+            for i in range(0, len(content), 4096):
+                await update.message.reply_text(content[i:i+4096])
+        else:
+            await update.message.reply_text(f"📋 {name}\n\n{content}")
     else:
         await update.message.reply_text(f"❌ No prompt found: {name}")
 
 async def list_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    names = db_list()
-    if not names:
-        await update.message.reply_text("📭 No prompts saved yet. Use /save to add one.")
-        return
-    keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"get:{n}")] for n in names]
-    await update.message.reply_text(f"📚 Your Prompts ({len(names)}):", reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        names = db_list()
+        if not names:
+            await update.message.reply_text("📭 No prompts saved yet. Use /save to add one.")
+            return
+        keyboard = [[InlineKeyboardButton(f"📋 {n}", callback_data=f"get:{n}")] for n in names]
+        await update.message.reply_text(f"📚 Your Prompts ({len(names)}):", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"list_prompts error: {e}")
+        await update.message.reply_text(f"❌ Error loading list: {e}")
 
 async def find_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -195,7 +217,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = data[4:]
         content = db_get(name)
         if content:
-            await query.message.reply_text(f"📋 {name}\n\n{content}")
+            header = f"📋 {name}\n\n"
+            if len(header + content) > 4096:
+                await query.message.reply_text(header)
+                for i in range(0, len(content), 4096):
+                    await query.message.reply_text(content[i:i+4096])
+            else:
+                await query.message.reply_text(f"📋 {name}\n\n{content}")
         else:
             await query.message.reply_text(f"❌ Prompt '{name}' not found.")
     elif data.startswith("del:"):
